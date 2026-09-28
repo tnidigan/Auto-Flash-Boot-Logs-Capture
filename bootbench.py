@@ -12,8 +12,12 @@ command line:
             manual y/N answer right before flashing).
   capture   Log in over the serial console and collect boot-time metrics
             (systemd-analyze, dmesg, journalctl, blame, critical-chain, etc.)
-            over N consecutive boots, pull them via adb, and record them into
-            the per-target JSON + regenerate the HTML report.
+            over N consecutive boots with the default kernel cmdline, then
+            add debug cmdline params (initcall_debug, log_buf_len=4M,
+            systemd.log_level=debug) to the on-device bootloader entry and
+            capture another N boots with those active, pull all 2N logs
+            via adb, and record them into the per-target JSON + regenerate
+            the HTML report.
   report    Standalone JSON/HTML report maintenance (render the HTML from the
             JSON, or manually append a run) -- only does anything when run
             without 'capture' in the same command; capture already records
@@ -719,9 +723,10 @@ def _format_run_txt(target, run):
         f"Device: {target}",
         f"Timestamp: {run['timestamp']}",
         f"Build path: {run.get('build_path', '')}",
-        "",
-        "Metrics:",
     ]
+    if run.get("phase"):
+        lines.append(f"Phase: {run['phase']} (boot {run.get('log_name', '').rsplit('-', 1)[-1]})")
+    lines += ["", "Metrics:"]
     for key, label, _ in METRIC_ROWS:
         m = run["metrics"].get(key, {})
         note = f"  ({m['note']})" if m.get("note") else ""
@@ -734,6 +739,18 @@ def _format_run_txt(target, run):
     if chain:
         lines.append("")
         lines.append("Critical chain: " + " -> ".join(chain))
+
+    overall_overheads = run.get("overall_overheads")
+    if overall_overheads:
+        lines.append("")
+        lines.append("Overall Suspected Overheads:")
+        for i, h in enumerate(overall_overheads):
+            h_note = f"  ({h['note']})" if h.get("note") else ""
+            lines.append(f"  #{i + 1}. {h['name']}: {h['time']}{h_note}")
+
+    if run.get("optimization_possibilities"):
+        lines.append("")
+        lines.append("Optimization possibilities: " + run["optimization_possibilities"])
 
     if run.get("source"):
         lines.append("")
@@ -805,9 +822,9 @@ CSS = """
   .subtitle code { background: var(--panel); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border); }
   h2 { font-size: 1.1rem; margin-top: 36px; margin-bottom: 12px; border-left: 3px solid var(--accent); padding-left: 10px; }
   table { border-collapse: collapse; background: var(--bg); border: 2px solid var(--border); }
-  th, td { text-align: left; padding: 12px 16px; border: 1px solid var(--border); white-space: nowrap; }
+  th, td { text-align: left; padding: 12px 19px; border: 1px solid var(--border); white-space: nowrap; }
   th { background: var(--panel); color: var(--muted); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
-  th.run-col { color: var(--accent); text-transform: none; letter-spacing: normal; font-size: 0.85rem; }
+  th.run-col { color: var(--accent); text-transform: none; letter-spacing: normal; font-size: 0.85rem; min-width: 520px; }
   th.run-col.latest { color: var(--text); background: #e8eefc; }
   tr.total td { font-weight: 600; color: var(--accent); background: #eef2fd; }
   td.timing { font-family: "SF Mono", Consolas, monospace; font-size: 0.95rem; }
@@ -817,11 +834,18 @@ CSS = """
   .delta.improved { color: var(--good); }
   .delta.regressed { color: var(--bad); }
   td.buildpath { font-family: "SF Mono", Consolas, monospace; font-size: 0.78rem; color: var(--muted); white-space: normal; word-break: break-all; text-align: center; }
-  th.entry-start, td.entry-start { border-left: 2px solid var(--accent); }
+  th.entry-start, td.entry-start { border-left: 3px solid var(--accent); padding-left: 20px; }
+  th.phase-start, td.phase-start { padding-left: 20px; }
   td:first-child .row-caption { display: block; font-weight: 400; font-size: 0.75rem; color: var(--muted); margin-top: 2px; white-space: normal; }
+  th .row-caption { display: block; font-weight: 400; font-size: 0.75rem; color: var(--muted); margin-top: 2px; white-space: normal; }
   td.timing ol.hitters { list-style: none; margin: 6px 0 0; padding: 0; white-space: normal; }
   td.timing ol.hitters li { font-size: 0.78rem; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--muted); margin-top: 2px; }
   td.timing ol.hitters li .hitter-name { font-family: "SF Mono", Consolas, monospace; }
+  td.optimization { white-space: normal; max-width: 420px; vertical-align: top; }
+  td.optimization .optimization-text { font-size: 0.85rem; line-height: 1.5; white-space: normal; word-wrap: break-word; }
+  td.optimization ul.optimization-text { margin: 0; padding-left: 18px; }
+  td.optimization ul.optimization-text li { margin-bottom: 6px; }
+  td.na { color: var(--muted); text-align: center; }
 """
 
 
@@ -829,15 +853,58 @@ def _boot_header_label(rec):
     boot = rec["boot"]
     if rec["n"] == 1:
         return boot["timestamp"]
+    log_name = boot.get("log_name")
+    if log_name:
+        phase, _n = log_name.rsplit("-", 1)
+        return phase.capitalize()
     time_part = boot["timestamp"].split(" ")[-1]
     return f"Boot {rec['idx'] + 1} · {time_part}"
+
+
+def _boot_header_subtitle(rec):
+    """Returns a small subtitle string to show under a column header, or
+    None. Content-based (checks metrics.kernel.hitters), not a threaded
+    flag -- correct even under --resume-pull, which never calls
+    ensure_debug_cmdline_params() at all."""
+    boot = rec["boot"]
+    if boot.get("phase") != "debug":
+        return None
+    if boot.get("metrics", {}).get("kernel", {}).get("hitters"):
+        return None
+    return "No debug prints enabled"
+
+
+def _phase_boundary(flat, i):
+    """True when boot i starts a new phase (e.g. debug right after default)
+    within the same multi-boot entry -- used to draw a visual separator
+    between the default and debug columns, distinct from entry-start's
+    separator between different captured runs."""
+    if i == 0:
+        return False
+    prev_phase = flat[i - 1]["boot"].get("phase")
+    cur_phase = flat[i]["boot"].get("phase")
+    return bool(prev_phase and cur_phase and prev_phase != cur_phase)
+
+
+def _col_extra_class(flat, i, rec):
+    classes = []
+    if rec["idx"] == 0 and i > 0:
+        classes.append("entry-start")
+    elif _phase_boundary(flat, i):
+        classes.append("phase-start")
+    return (" " + " ".join(classes)) if classes else ""
 
 
 def _header_cells(flat):
     return "".join(
         f'<th class="run-col{" latest" if i == len(flat) - 1 else ""}'
-        f'{" entry-start" if rec["idx"] == 0 and i > 0 else ""}">'
-        f'{esc(_boot_header_label(rec))}</th>'
+        f'{_col_extra_class(flat, i, rec)}">'
+        f'{esc(_boot_header_label(rec))}'
+        + (
+            f'<span class="row-caption">{esc(_boot_header_subtitle(rec))}</span>'
+            if _boot_header_subtitle(rec) else ""
+        )
+        + '</th>'
         for i, rec in enumerate(flat)
     )
 
@@ -882,6 +949,42 @@ def _hitters_html(hitters):
     return f'<ol class="hitters">{"".join(items)}</ol>'
 
 
+def _optimization_html(text):
+    """Renders optimization_possibilities as a bulleted list, one <li> per
+    newline-separated point (each point names a service/probe hitter and its
+    suggested fix -- see SKILL.md workflow step 4). Falls back to a single
+    wrapped block for older entries that are still one paragraph (no
+    newlines)."""
+    lines = [l.strip().lstrip("•").strip() for l in text.splitlines() if l.strip()]
+    if len(lines) <= 1:
+        return f'<div class="optimization-text">{esc(text)}</div>'
+    items = "".join(f"<li>{esc(line)}</li>" for line in lines)
+    return f'<ul class="optimization-text">{items}</ul>'
+
+
+def render_overall_rows(flat):
+    """Two rows appended below the per-stage metric rows: 'Overall Suspected
+    Overheads' (the pooled, cross-stage top hitters computed in build_run)
+    and 'Optimization Possibilities' (an agent-filled placeholder, present
+    only on debug boots that had kernel hitters)."""
+    overhead_cells = []
+    optimization_cells = []
+    for i, rec in enumerate(flat):
+        boot = rec["boot"]
+        cls = _col_extra_class(flat, i, rec)
+        overheads = boot.get("overall_overheads") or []
+        overhead_html = _hitters_html(overheads) if overheads else '<span class="na">–</span>'
+        overhead_cells.append(f'<td class="timing{cls}">{overhead_html}</td>')
+
+        optimization = boot.get("optimization_possibilities")
+        optimization_html = _optimization_html(optimization) if optimization else '<span class="na">–</span>'
+        optimization_cells.append(f'<td class="timing optimization{cls}">{optimization_html}</td>')
+
+    overhead_row = f"<tr><td>Overall Suspected Overheads</td>{''.join(overhead_cells)}</tr>"
+    optimization_row = f"<tr><td>Optimization Possibilities</td>{''.join(optimization_cells)}</tr>"
+    return overhead_row + optimization_row
+
+
 def render_metrics_table(runs):
     flat = _flatten(runs)
     header_cells = _header_cells(flat)
@@ -902,10 +1005,11 @@ def render_metrics_table(runs):
                     delta_html = f'<span class="delta {delta_cls}">{delta_label}</span>'
             note_html = f'<span class="note">{esc(note)}</span>' if note and note != caption else ""
             hitters_html = _hitters_html(_metric_hitters(boot, key))
-            cls = "timing" + (" entry-start" if rec["idx"] == 0 and i > 0 else "")
+            cls = "timing" + _col_extra_class(flat, i, rec)
             cells.append(f'<td class="{cls}">{esc(value)}{delta_html}{note_html}{hitters_html}</td>')
         row_class = ' class="total"' if is_total else ""
         rows_html.append(f"<tr{row_class}><td>{label_html}</td>{''.join(cells)}</tr>")
+    rows_html.append(render_overall_rows(flat))
     return f"""
   <table>
     <thead><tr><th>Stage</th>{header_cells}</tr></thead>
@@ -1154,6 +1258,51 @@ def parse_dmesg_milestones(text: str) -> dict:
     }
 
 
+INITCALL_PROBE_RE = re.compile(r"(?:initcall|probe of) (\S+) returned (-?\d+) after (\d+) usecs")
+PROBE_FAIL_RE = re.compile(r"(\S+): probe with driver \S+ failed with error (-?\d+)")
+
+
+def parse_kernel_hitters(dmesg_text: str, top_n_slow: int = 3, max_failures: int = 3):
+    """Extracts debug-cmdline-derived kernel init signal from a debug-phase
+    dmesg (requires initcall_debug to be active -- see ensure_debug_cmdline_params):
+    the top_n_slow slowest probes/initcalls by usecs, followed by up to
+    max_failures probe/initcall failures (deduped by name). Returns None if
+    dmesg carries no initcall/probe timing at all -- a content-based signal
+    that debug cmdline params weren't active for this boot, correct
+    regardless of the reason (Type #2 bootloader, --resume-pull, etc.)."""
+    probe_matches = list(INITCALL_PROBE_RE.finditer(dmesg_text))
+    fail_matches = list(PROBE_FAIL_RE.finditer(dmesg_text))
+    if not probe_matches and not fail_matches:
+        return None
+
+    slow = sorted(
+        ((m.group(1), int(m.group(2)), int(m.group(3))) for m in probe_matches),
+        key=lambda t: t[2], reverse=True,
+    )[:top_n_slow]
+    slow_list = [
+        {"name": name, "time": f"{usecs / 1_000_000:.3f} s", "note": "slowest probe/initcall"}
+        for name, _rc, usecs in slow
+    ]
+
+    failures = []
+    seen = set()
+    for m in probe_matches:
+        name, rc, _usecs = m.group(1), m.group(2), m.group(3)
+        if rc == "0" or name in seen:
+            continue
+        seen.add(name)
+        failures.append({"name": name, "time": f"rc={rc}", "note": "probe/initcall failure"})
+    for m in fail_matches:
+        name, rc = m.group(1), m.group(2)
+        if name in seen:
+            continue
+        seen.add(name)
+        failures.append({"name": name, "time": f"error {rc}", "note": "probe failure"})
+    failures = failures[:max_failures]
+
+    return slow_list + failures
+
+
 def parse_journalctl_milestone(text: str) -> float:
     """Returns the monotonic timestamp of 'Reached target System
     Initialization.' from journalctl --output=short-monotonic -- this
@@ -1173,6 +1322,7 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
     cc_multiuser_s, chain = parse_critical_chain(cc_text)
     hitters = parse_blame(blame_text)
     sysinit_hitters = parse_stage_hitters(cc_sysinit_text)
+    kernel_hitters = parse_kernel_hitters(dmesg_text)
     milestones = parse_dmesg_milestones(dmesg_text)
     sysinit_target_s = parse_journalctl_milestone(journalctl_text)
 
@@ -1192,6 +1342,21 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
     if grand_total - total_multiuser >= DELTA_MERGE_S:
         multiuser_note = f"≈{grand_total:.3f} s incl. graphical.target"
 
+    kernel_metric = {"value": f"{kernel:.3f} s", "note": ""}
+    if kernel_hitters:
+        kernel_metric["hitters"] = kernel_hitters
+
+    def _hitter_seconds(h):
+        m = TIME_RE.search(h.get("time", ""))
+        return float(m.group()) if m else -1.0
+
+    pool = []
+    for source_hitters in (kernel_hitters or [], sysinit_hitters, hitters):
+        pool.extend(source_hitters)
+    pool = [h for h in pool if _hitter_seconds(h) >= 0]
+    pool.sort(key=_hitter_seconds, reverse=True)
+    overall_overheads = pool[:3]
+
     run = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "build_path": build_path,
@@ -1200,7 +1365,7 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
                 "value": f"{nhlos:.3f} s",
                 "note": f"{sat['firmware']:.3f} s firmware + {sat['loader']:.3f} s loader",
             },
-            "kernel": {"value": f"{kernel:.3f} s", "note": ""},
+            "kernel": kernel_metric,
             "initramfs": {
                 "value": f"{initramfs_s:.3f} s",
                 "note": f"{init_exec:.3f} s → {epoch_advanced:.3f} s",
@@ -1218,6 +1383,8 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
             },
         },
         "critical_chain": chain,
+        "overall_overheads": overall_overheads,
+        "optimization_possibilities": None,
         "source": (
             f"systemd-analyze time -> Startup finished in {sat['firmware']:.3f}s (firmware) + "
             f"{sat['loader']:.3f}s (loader) + {sat['kernel']:.3f}s (kernel) + "
@@ -1227,7 +1394,9 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
             f"journalctl: Reached target System Initialization @{sysinit_target_s:.3f}s; "
             f"initramfs = Run/init -> epoch-advance; sysinit_svc = epoch-advance -> sysinit.target; "
             f"sysinit hitters from `systemd-analyze critical-chain sysinit.target` "
-            f"(+cost per unit); multi-user hitters from `systemd-analyze blame`"
+            f"(+cost per unit); multi-user hitters from `systemd-analyze blame`; "
+            f"kernel hitters (debug boots only) from initcall_debug dmesg output; "
+            f"overall_overheads pools kernel/sysinit/multi-user hitters and ranks by actual duration"
         ),
     }
     return run
@@ -1236,6 +1405,142 @@ def build_run(target: str, build_path: str, sat_text: str, cc_text: str,
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+DEBUG_CMDLINE_HEREDOC_MARKER = "DEBUG_CMDLINE_EOF"
+
+BOOTCTL_SOURCE_RE = re.compile(r"source:\s*(\S+)")
+
+# name-only presence check: any value counts as satisfied (the user may
+# want a different buffer size than our default).
+LOG_BUF_LEN_RE = re.compile(r"(?<![^\s])log_buf_len=\S+")
+LOG_BUF_LEN_PARAM = "log_buf_len=4M"
+
+# exact-match checks: token must be present verbatim (initcall_debug) or
+# with exactly this value (systemd.log_level=debug) -- unlike log_buf_len
+# above, a differing value does not count as already satisfied.
+EXACT_CMDLINE_PARAMS = [
+    (re.compile(r"(?<![^\s])initcall_debug(?![^\s])"), "initcall_debug"),
+    (re.compile(r"(?<![^\s])systemd\.log_level=debug(?![^\s])"), "systemd.log_level=debug"),
+]
+# Matches systemd.log_level= with ANY value, used only to strip a stale
+# differing value before re-appending the correct one -- otherwise the
+# line would end up with two conflicting systemd.log_level= tokens.
+STALE_LOG_LEVEL_RE = re.compile(r"(?<![^\s])systemd\.log_level=\S+")
+
+
+def resolve_boot_entry(ser):
+    """Determines the on-device bootloader entry file to edit for debug
+    cmdline params, without hardcoding a path. Runs `bootctl status | grep
+    type` -- if the device isn't a Boot Loader Specification Type #1 (i.e.
+    Type #2 or unrecognized), there's no per-entry options line to edit, so
+    returns None. Otherwise runs `bootctl status | grep conf` and pulls the
+    current entry's real `source:` path out of that output. Returns the
+    resolved path string, or None if not Type #1."""
+    type_output = run_serial_command(ser, "bootctl status | grep type")
+    if "Type #1" not in type_output:
+        return None
+
+    conf_output = run_serial_command(ser, "bootctl status | grep conf")
+    match = BOOTCTL_SOURCE_RE.search(conf_output)
+    if not match:
+        raise RuntimeError(
+            "bootctl status reports Boot Loader Specification Type #1, but no "
+            f"'source:' line was found in its conf output to resolve the current "
+            f"entry file: {conf_output!r}"
+        )
+    return match.group(1)
+
+
+def ensure_debug_cmdline_params(ser):
+    """Adds any missing debug kernel cmdline params (initcall_debug,
+    log_buf_len=4M, systemd.log_level=debug) to the 'options' line of the
+    device's current bootloader entry (resolved dynamically via
+    resolve_boot_entry, never hardcoded), then syncs. Idempotent and
+    order-independent: only params that are missing (or, for
+    systemd.log_level, present with the wrong value) are added/corrected;
+    params already present are left untouched. Never reverted once
+    added -- intentional, so a later capture run doesn't need to redo
+    this if the device wasn't reflashed in between. Returns the entry path
+    that was edited, or None if the device is Boot Loader Specification
+    Type #2 (or unrecognized) and has no per-entry options line to edit."""
+    entry_path = resolve_boot_entry(ser)
+    if entry_path is None:
+        print(
+            "bootctl reports Boot Loader Specification Type #2 (or unrecognized) "
+            "-- no per-entry options line to edit; skipping debug kernel cmdline params."
+        )
+        return None
+
+    try:
+        run_serial_command(ser, f"test -f {entry_path}")
+    except RuntimeError as e:
+        # Checked via exit code (rc!=0), not by parsing echoed EXISTS/MISSING
+        # text -- async kernel log lines (e.g. driver probe noise) can print
+        # to the console with no newline before the echo, and
+        # _strip_kernel_log_noise strips to the end of that physical line,
+        # which can eat the echoed text itself and misreport a real file as
+        # missing. rc-based detection (same mechanism run_serial_command
+        # already uses for every other command) doesn't depend on parsing
+        # command output at all.
+        raise RuntimeError(
+            f"Bootloader entry file not found on device: {entry_path}; "
+            f"cannot add debug kernel cmdline params. ({e})"
+        ) from e
+
+    content = run_serial_command(ser, f"cat {entry_path}", strip_noise=False)
+    lines = content.splitlines()
+    options_idx = next((i for i, l in enumerate(lines) if l.startswith("options ")), None)
+    if options_idx is None:
+        raise RuntimeError(
+            f"No 'options' line found in {entry_path}; "
+            "cannot append debug kernel cmdline params."
+        )
+
+    options_line = lines[options_idx]
+    to_append, already_present, corrected = [], [], []
+
+    if LOG_BUF_LEN_RE.search(options_line):
+        already_present.append(LOG_BUF_LEN_PARAM)
+    else:
+        to_append.append(LOG_BUF_LEN_PARAM)
+
+    for match_re, param in EXACT_CMDLINE_PARAMS:
+        if match_re.search(options_line):
+            already_present.append(param)
+            continue
+        stale = STALE_LOG_LEVEL_RE.search(options_line) if param == "systemd.log_level=debug" else None
+        if stale:
+            options_line = STALE_LOG_LEVEL_RE.sub(param, options_line)
+            corrected.append(f"{stale.group(0)} -> {param}")
+        else:
+            to_append.append(param)
+
+    if not to_append and not corrected:
+        print(f"Debug cmdline params already present in {entry_path}, skipping.")
+        return entry_path
+
+    if to_append:
+        options_line = options_line.rstrip() + " " + " ".join(to_append)
+    lines[options_idx] = options_line
+
+    if to_append:
+        print(f"Adding debug cmdline params: {', '.join(to_append)}")
+    if corrected:
+        print(f"Correcting: {', '.join(corrected)}")
+    if already_present:
+        print(f"Already present, left unchanged: {', '.join(already_present)}")
+
+    new_content = "\n".join(lines) + "\n"
+    write_cmd = (
+        f"cat > {entry_path} << '{DEBUG_CMDLINE_HEREDOC_MARKER}'\n"
+        f"{new_content}"
+        f"{DEBUG_CMDLINE_HEREDOC_MARKER}\n"
+        f"sync"
+    )
+    run_serial_command(ser, write_cmd, timeout_s=60)
+    print(f"Updated {entry_path} and synced.")
+    return entry_path
+
 
 def ensure_collect_script(ser):
     """Writes collect_boot_logs.sh to COLLECT_SCRIPT_REMOTE_PATH if it isn't
@@ -1256,18 +1561,18 @@ def ensure_collect_script(ser):
     run_serial_command(ser, write_cmd, timeout_s=60)
 
 
-def collect_boot_on_device(ser, boot_index: int):
+def collect_boot_on_device(ser, log_name: str):
     """Runs collect_boot_logs.sh (provisioning it first if needed), syncs,
-    renames /data/Logs -> /data/Logs-<boot_index> so it survives the next
-    boot's run, and syncs again."""
+    renames /data/Logs -> /data/Logs-<log_name> (e.g. "default-1",
+    "debug-2") so it survives the next boot's run, and syncs again."""
     ensure_collect_script(ser)
 
-    print(f"Running collect_boot_logs.sh (boot {boot_index}) ...")
+    print(f"Running collect_boot_logs.sh (boot {log_name}) ...")
     run_serial_command(ser, f"sh {COLLECT_SCRIPT_REMOTE_PATH}", timeout_s=180)
     run_serial_command(ser, "sync")
 
-    print(f"Renaming /data/Logs -> /data/Logs-{boot_index} ...")
-    run_serial_command(ser, f"rm -rf /data/Logs-{boot_index}; mv /data/Logs /data/Logs-{boot_index}")
+    print(f"Renaming /data/Logs -> /data/Logs-{log_name} ...")
+    run_serial_command(ser, f"rm -rf /data/Logs-{log_name}; mv /data/Logs /data/Logs-{log_name}")
     run_serial_command(ser, "sync")
 
 
@@ -1314,40 +1619,41 @@ def _adb_root(retries: int = 3, retry_delay_s: float = 2.0):
     )
 
 
-def adb_pull_logs(local_dir: Path, num_boots: int):
-    """Pulls /data/Logs-1 .. /data/Logs-<num_boots> into local_dir in a
-    single `adb pull`, one Logs-<n> subfolder per boot. `adb root` first --
-    /data/Logs-* is only readable as root on this device -- which restarts
-    adbd, so we re-wait for the device to come back before pulling."""
+def adb_pull_logs(local_dir: Path, log_names: list):
+    """Pulls /data/Logs-<name> for every name in log_names (e.g.
+    ["default-1", "default-2", "default-3", "debug-1", ...]) into
+    local_dir in a single `adb pull`. `adb root` first -- /data/Logs-* is
+    only readable as root on this device -- which restarts adbd, so we
+    re-wait for the device to come back before pulling."""
     local_dir.mkdir(parents=True, exist_ok=True)
 
     print("Restarting adb as root ...")
     _adb_root()
     wait_for_adb_device()
 
-    remote_dirs = [f"/data/Logs-{i}" for i in range(1, num_boots + 1)]
+    remote_dirs = [f"/data/Logs-{name}" for name in log_names]
     print(f"Pulling {', '.join(remote_dirs)} -> {local_dir} ...")
     subprocess.run(["adb", "pull", *remote_dirs, str(local_dir)], check=True)
 
 
-def _read_pulled_file(local_dir: Path, boot_index: int, filename: str) -> str:
-    path = local_dir / f"Logs-{boot_index}" / filename
+def _read_pulled_file(local_dir: Path, log_name: str, filename: str) -> str:
+    path = local_dir / f"Logs-{log_name}" / filename
     if not path.exists():
         raise RuntimeError(f"Expected pulled log file not found: {path}")
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def read_pulled_logs(local_dir: Path, boot_index: int) -> dict:
+def read_pulled_logs(local_dir: Path, log_name: str) -> dict:
     """Reads the collect_boot_logs.sh outputs for one boot out of
-    local_dir/Logs-<boot_index>/, already pulled from the device via
+    local_dir/Logs-<log_name>/, already pulled from the device via
     adb_pull_logs. Maps to the same text arguments build_run() needs."""
     return {
-        "sat_text": _read_pulled_file(local_dir, boot_index, "systemd_analyze.txt"),
-        "cc_text": _read_pulled_file(local_dir, boot_index, "systemd-analyze_critical_chain.txt"),
-        "cc_sysinit_text": _read_pulled_file(local_dir, boot_index, "systemd-analyze_critical_chain_sysinit.txt"),
-        "blame_text": _read_pulled_file(local_dir, boot_index, "blame_systemd.txt"),
-        "dmesg_text": _read_pulled_file(local_dir, boot_index, "dmesg.txt"),
-        "journalctl_text": _read_pulled_file(local_dir, boot_index, "journalctl.log"),
+        "sat_text": _read_pulled_file(local_dir, log_name, "systemd_analyze.txt"),
+        "cc_text": _read_pulled_file(local_dir, log_name, "systemd-analyze_critical_chain.txt"),
+        "cc_sysinit_text": _read_pulled_file(local_dir, log_name, "systemd-analyze_critical_chain_sysinit.txt"),
+        "blame_text": _read_pulled_file(local_dir, log_name, "blame_systemd.txt"),
+        "dmesg_text": _read_pulled_file(local_dir, log_name, "dmesg.txt"),
+        "journalctl_text": _read_pulled_file(local_dir, log_name, "journalctl.log"),
     }
 
 
@@ -1374,9 +1680,10 @@ def reboot_and_relogin(com_port: str, timeout_s: int):
 
 
 def pull_and_record(target: str, build_path: str, num_boots: int = 3) -> Path:
-    """Pulls the already-collected /data/Logs-1..N off the device (adb must
-    already be enabled and the device already rebooted past the last boot's
-    capture) and builds/records the JSON+HTML report. Split out from
+    """Pulls the already-collected /data/Logs-default-1..N and
+    /data/Logs-debug-1..N off the device (adb must already be enabled and
+    the device already rebooted past the last boot's capture) and
+    builds/records the JSON+HTML report. Split out from
     capture_and_record() so a run that reaches this point but then fails
     (e.g. a transient `adb root` error) can be resumed with
     `--resume-pull` instead of repeating the flash and all boots."""
@@ -1384,24 +1691,38 @@ def pull_and_record(target: str, build_path: str, num_boots: int = 3) -> Path:
     wait_for_adb_device()
 
     local_dir = boot_logs_run_dir(target, build_path)
-    adb_pull_logs(local_dir, num_boots)
+    log_names = [f"default-{i + 1}" for i in range(num_boots)] + [f"debug-{i + 1}" for i in range(num_boots)]
+    adb_pull_logs(local_dir, log_names)
 
     boots = []
-    for i in range(num_boots):
-        texts = read_pulled_logs(local_dir, i + 1)
+    for log_name in log_names:
+        phase, n = log_name.rsplit("-", 1)
+        texts = read_pulled_logs(local_dir, log_name)
         boot = build_run(
             target, build_path,
             texts["sat_text"], texts["cc_text"], texts["cc_sysinit_text"],
             texts["blame_text"], texts["dmesg_text"], texts["journalctl_text"],
         )
+        boot["phase"] = phase
+        boot["log_name"] = log_name
+        if phase == "debug" and boot["metrics"]["kernel"].get("hitters"):
+            boot["optimization_possibilities"] = (
+                "Not yet analyzed — ask an agent to review the overheads above and suggest fixes."
+            )
         boots.append(boot)
         txt_path = save_run_backup(target, boot)
-        print(f"Backed up boot {i + 1} -> {txt_path}")
+        print(f"Backed up boot {log_name} -> {txt_path}")
+
+    # Only the first boot of each phase is recorded/rendered into the
+    # JSON+HTML report (keeps the report compact); every boot is still
+    # pulled, parsed, and permanently backed up above regardless of
+    # num_boots.
+    displayed_boots = [boots[0], boots[num_boots]]
 
     entry = {
-        "timestamp": boots[0]["timestamp"],
+        "timestamp": displayed_boots[0]["timestamp"],
         "build_path": build_path,
-        "boots": boots,
+        "boots": displayed_boots,
     }
 
     data_path, html_path = _data_html_paths(target)
@@ -1412,8 +1733,8 @@ def pull_and_record(target: str, build_path: str, num_boots: int = 3) -> Path:
     save_data(data, data_path)
     render(data_path, html_path)
 
-    print(f"\nRecorded entry '{entry['timestamp']}' with {num_boots} boot(s) "
-          f"({len(data['runs'])} total entries) -> {data_path}")
+    print(f"\nRecorded entry '{entry['timestamp']}' with {len(displayed_boots)} boot(s) displayed "
+          f"({len(boots)} captured total, {len(data['runs'])} total entries) -> {data_path}")
     print(f"Report regenerated -> {html_path}")
 
     return html_path
@@ -1430,12 +1751,19 @@ def capture_and_record(target: str, build_path: str,
         target = detect_target_via_serial(ser)
         print(f"Detected target: {target} (via {com_port})")
 
-    for i in range(num_boots):
-        print(f"\n--- Boot {i + 1}/{num_boots} ---")
-        collect_boot_on_device(ser, i + 1)
-        if i < num_boots - 1:
+    boot_units = [("default", i + 1) for i in range(num_boots)] + \
+                 [("debug", i + 1) for i in range(num_boots)]
+
+    for idx, (phase, n) in enumerate(boot_units):
+        if idx > 0:
+            if phase == "debug" and n == 1:
+                print("Adding debug kernel cmdline params ...")
+                ensure_debug_cmdline_params(ser)
             ser.close()
             ser, com_port = reboot_and_relogin(com_port, boot_timeout)
+        log_name = f"{phase}-{n}"
+        print(f"\n--- Boot {log_name} ({idx + 1}/{len(boot_units)}) ---")
+        collect_boot_on_device(ser, log_name)
 
     enable_adb(ser)
     ser.close()
@@ -1638,7 +1966,7 @@ def build_parser():
 
     capture_group = parser.add_argument_group("capture")
     capture_group.add_argument("--build-path", help=r'Nightly build path this boot used, e.g. "\\swayam\...\performance" (required if capture runs without flash in the same command; supplied automatically otherwise)')
-    capture_group.add_argument("--num-boots", type=int, default=3, help="Number of consecutive boots to capture (default: 3)")
+    capture_group.add_argument("--num-boots", type=int, default=3, help="Number of consecutive boots to capture PER PHASE -- e.g. 3 (the default) captures 3 default-cmdline boots then 3 debug-cmdline boots (6 total). Values < 1 fall back to 3.")
     capture_group.add_argument("--resume-pull", action="store_true", help="Skip login/boot-loop entirely: adb is already enabled and all boots' /data/Logs-<n> are already on the device (a prior run reached adb pull and failed partway) -- just pull logs and (re)build the report. Requires --target and --build-path.")
 
     report_group = parser.add_argument_group("report")
@@ -1652,6 +1980,10 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     stages = parse_stages(args.stage)
+
+    if args.num_boots < 1:
+        print(f"--num-boots must be >= 1 (got {args.num_boots}); defaulting to 3.")
+        args.num_boots = 3
 
     if args.recover and "flash" not in stages:
         parser.error("--recover requires the 'flash' stage")
