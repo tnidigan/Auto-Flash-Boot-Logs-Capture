@@ -100,9 +100,19 @@ python3 bootbench.py all --yes
    then probes every enumerated Windows COM port until one shows a live
    login/shell prompt for the target (skipped if `--com-port` is given).
 
-3. **Identify the device name** *(`flash` stage)*
+3. **Identify the device name and on-board memory type** *(`flash` stage)*
    Logs into the serial console and runs `uname -n` to get the target name
-   (e.g. `iq-9075-evk`), unless `--target` is given explicitly.
+   (e.g. `iq-9075-evk`), unless `--target` is given explicitly. In the same
+   console session, also runs `lsblk` to determine whether the device's
+   storage is **UFS** or **EMMC** — unless `--memory-type` is given
+   explicitly — since the two require different PCAT `-MEMORYTYPE` values
+   to flash correctly:
+   - **UFS**: top-level SCSI disks named `sda`, `sdb`, `sdc`, ... (with
+     partitions `sda1`, `sda2`, ...)
+   - **EMMC**: a top-level `mmcblk0` disk (with partitions `mmcblk0p1`,
+     `mmcblk0p2`, ...), alongside `mmcblk0boot0`/`mmcblk0boot1`
+   Only given once both `--target` and `--memory-type` are supplied does
+   this step skip opening a serial console entirely.
 
 4. **Resolve the matching build folder** *(`flash` stage)*
    Looks for `<latest_build>\performance\qcom-multimedia-proprietary-image-<target>`
@@ -111,11 +121,24 @@ python3 bootbench.py all --yes
 5. **Enter EDL mode and flash** *(`flash` stage)*
    Triggers `BootToEDL` via the Alpaca TAC, waits for the device to
    re-enumerate, discovers it via PCAT, confirms with the user (unless
-   `--yes`), then flashes via `PCAT -PLUGIN SD`.
+   `--yes`), then flashes via `PCAT -PLUGIN SD` using the memory type
+   detected (or overridden) in step 3 — `-MEMORYTYPE UFS` or
+   `-MEMORYTYPE EMMC` as appropriate (no longer hardcoded to `UFS`).
 
 6. **Capture boot-time data** *(`capture` stage — runs when named alongside `flash`, e.g. `bootbench.py flash capture`, or standalone against an already-flashed device via `bootbench.py capture --build-path ...`)*
    - Logs back into the serial console (reusing the target/build-path/COM
      port `flash` just resolved, when run in the same command)
+   - Immediately after login (before any boot loop runs), reads device
+     identification fields over that same serial console — `Machine`
+     (`/proc/device-tree/model`), `SoC` (`/sys/devices/soc0/machine` +
+     `/revision`), `OS` (`/etc/os-release`), `Kernel` (`uname -r`), `Serial`
+     (`/sys/devices/soc0/serial_number`), plus a `Captured` timestamp.
+     Collected once per capture run (not per boot, since these don't change
+     between the default/debug boots of one run); any field the device
+     doesn't expose is simply omitted rather than failing the capture.
+     Skipped entirely by `--resume-pull` (no serial console is opened); the
+     run entry it records simply has no snapshot of its own, while every
+     other run keeps whatever it captured.
    - Runs a **two-phase** capture, `--num-boots` boots per phase (default
      3 + 3 = 6 boots total):
      - **Default phase** — for each of N boots:
@@ -198,11 +221,21 @@ python3 bootbench.py all --yes
        block instead of a list.
    - Appends the new run to `Boot-Charts/bootchart-data-<target>.json`
      (keeps the most recent 30 runs; full history is preserved separately as
-     `.txt` backups under `Boot-Logs/`)
+     `.txt` backups under `Boot-Logs/`). The `Machine`/`SoC`/`OS`/`Kernel`/
+     `Serial`/`Captured` snapshot collected right after login is stored
+     **on this run's own entry** (not overwritten globally) — since
+     kernel/OS version and the captured timestamp legitimately differ
+     across builds, every captured run keeps its own snapshot permanently.
+     `--resume-pull` never opens a serial console, so the run it records has
+     no snapshot of its own (rendered as `–` in its column).
    - Regenerates `Boot-Charts/bootchart-overview-<target>.html` **entirely**
-     from that JSON (the HTML is never hand-edited) — shows boot-time trends
-     per stage across runs, deltas vs. the previous run, and ranked slow
-     units
+     from that JSON (the HTML is never hand-edited) — shows a **Device
+     Information** table (Machine/SoC/OS/Kernel/Serial/Captured rows) styled
+     identically to, and positioned above, the Boot Time Summary table, with
+     one column per captured build/run (not per boot, since these fields
+     don't change between a run's default/debug boots) — followed by
+     boot-time trends per stage across runs, deltas vs. the previous run,
+     and ranked slow units
    - The report is written to disk but is **not** auto-opened in a browser —
      open `Boot-Charts/bootchart-overview-<target>.html` yourself when ready
 
@@ -224,9 +257,12 @@ python3 bootbench.py all --yes
   each run entry records only the first default boot and first debug boot,
   even if `--num-boots` captured more
 - `Boot-Charts/bootchart-overview-<slug>.html` — human-readable report,
-  always regenerated from the JSON above; two columns per run ("Default" /
-  "Debug"), each with an Overall Suspected Overheads row and an
-  Optimization Possibilities row
+  always regenerated from the JSON above; a **Device Information** table
+  (Machine/SoC/OS/Kernel/Serial/Captured rows) styled like, and shown above,
+  the Boot Time Summary table — one column per captured build/run, since
+  these fields can differ build-to-build — then the Boot Time Summary table
+  itself with two columns per run ("Default" / "Debug"), each with an
+  Overall Suspected Overheads row and an Optimization Possibilities row
 - `Boot-Logs/<target>/<build-folder>/` — raw per-boot log dumps
   (`Logs-default-1`, `Logs-default-2`, ..., `Logs-debug-1`, ...) plus
   permanent per-run `.txt` backups (unbounded history, unlike the 30-run
@@ -246,6 +282,7 @@ bootbench.py {flash,capture,report,all} [{flash,capture,report,all} ...] [option
 
 **`flash`:**
 - `--tac-port TAC_PORT` — Alpaca TAC COM port (auto-detected if only one TAC device)
+- `--memory-type {UFS,EMMC}` — override/declare the on-board storage type passed to PCAT's `-MEMORYTYPE` (auto-detected via `lsblk` over serial console if omitted)
 - `--dry-run` — resolve paths and print the plan, then exit before touching the device
 - `--yes` — skip the y/N confirmation prompt before flashing
 - `--skip-edl` — device is already in EDL mode; skip the TAC BootToEDL step
